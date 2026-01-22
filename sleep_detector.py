@@ -222,30 +222,57 @@ class SleepDetector:
         crop_height = crop_shape[0]
         
         has_shoulders = has_pt(5) and has_pt(6)
-        has_face = has_pt(0) or has_pt(1) or has_pt(2) or has_pt(3) or has_pt(4)
 
-        if has_shoulders and not has_face:
+        # IMPROVED: Face definition
+        has_nose = has_pt(0)
+        has_eyes = has_pt(1) or has_pt(2)
+
+        # 1. Head Buried / High Shoulders
+        # Fixed: allow check even if face points are noisy, rely on shoulder position
+        if has_shoulders:
             shoulder_y = (kpts[5][1] + kpts[6][1]) / 2
-            if shoulder_y < crop_height * 0.25:
-                result['is_sleeping'] = True
-                result['reason'] = "head_buried_high_shoulders"
-                result['details']['shoulder_height_ratio'] = shoulder_y / crop_height
-                return result
-            else:
-                return result
+            shoulder_width = abs(kpts[5][0] - kpts[6][0])
+
+            # Threshold increased to 0.32 to catch people slumped on desk (shoulders high)
+            if shoulder_y < crop_height * 0.32:
+                # Safeguard: If face is clearly upright, do NOT classify as buried
+                # "Upright" means nose is significantly above shoulders
+                is_clearly_upright = False
+                if has_nose:
+                    nose_y = kpts[0][1]
+                    # If nose is high above shoulders (large negative difference)
+                    # For ID 2 (Awake): Diff is -72px (approx -0.5 * shoulder_width)
+                    # For ID 1 (Sleep): Diff is -22px (approx -0.2 * shoulder_width)
+                    if shoulder_width > 0 and (nose_y - shoulder_y) < (-0.4 * shoulder_width):
+                        is_clearly_upright = True
+
+                if not is_clearly_upright:
+                    result['is_sleeping'] = True
+                    result['reason'] = "head_buried_high_shoulders"
+                    result['details']['shoulder_height_ratio'] = shoulder_y / crop_height
+                    return result
         
+        # 2. Slumped Forward (Nose below shoulders)
         if has_pt(0) and has_shoulders:
             nose_y = kpts[0][1]
             shoulder_y = (kpts[5][1] + kpts[6][1]) / 2
-            if nose_y > shoulder_y + 30:
+
+            # Use relative threshold instead of 30px
+            threshold = 30
+            if crop_height > 100:
+                threshold = crop_height * 0.1
+
+            if nose_y > shoulder_y + threshold:
                 result['is_sleeping'] = True
                 result['reason'] = "slumped_forward"
                 result['details']['slump_distance'] = nose_y - shoulder_y
                 return result
         
+        # 3. Active Check (Hands)
         has_wrists = has_pt(9) or has_pt(10)
         if has_shoulders and has_wrists:
             shoulder_y = (kpts[5][1] + kpts[6][1]) / 2
+            shoulder_width = abs(kpts[5][0] - kpts[6][0])
             wrist_y = 0
             if has_pt(9) and has_pt(10): 
                 wrist_y = max(kpts[9][1], kpts[10][1])
@@ -254,7 +281,12 @@ class SleepDetector:
             else: 
                 wrist_y = kpts[10][1]
             
-            if wrist_y > shoulder_y + 80:
+            # Use relative threshold
+            thresh_wrist = 80
+            if shoulder_width > 0:
+                thresh_wrist = shoulder_width * 0.8
+
+            if wrist_y > shoulder_y + thresh_wrist:
                 result['is_writing'] = True
                 result['reason'] = "hands_on_desk"
                 result['details']['hand_position'] = "active"
@@ -263,16 +295,20 @@ class SleepDetector:
                     if nose_y > shoulder_y + 10 and nose_y < shoulder_y + 50: 
                         return result
         
+        # 4. Head Tilt
         if has_pt(1) and has_pt(2):
             tilt = abs(kpts[1][1] - kpts[2][1])
-            if tilt > 40:
+            if tilt > 40: # This is still absolute, but tilt is angle-proxy
                 result['is_sleeping'] = True
                 result['reason'] = "head_tilted"
                 result['details']['tilt_amount'] = tilt
                 return result
         
+        # 5. Collapsed Posture (Background filtering)
         if has_shoulders and (has_pt(11) or has_pt(12)):
             shoulder_y = (kpts[5][1] + kpts[6][1]) / 2
+            shoulder_width = abs(kpts[5][0] - kpts[6][0])
+
             hip_y = 0
             if has_pt(11) and has_pt(12): 
                 hip_y = (kpts[11][1] + kpts[12][1]) / 2
@@ -281,11 +317,24 @@ class SleepDetector:
             else: 
                 hip_y = kpts[12][1]
             torso_length = abs(hip_y - shoulder_y)
-            if torso_length < 60:
-                result['is_sleeping'] = True
-                result['reason'] = "collapsed_posture"
-                result['details']['torso_length'] = torso_length
-                return result
+
+            # FIXED: Use relative ratio check instead of absolute pixels
+            # ID 4 (Background): Ratio ~3.35 (Safe)
+            # Collapsed/Hunched: Ratio < 0.8 (Trigger)
+            if shoulder_width > 0:
+                ratio = torso_length / shoulder_width
+                if ratio < 0.8:
+                    result['is_sleeping'] = True
+                    result['reason'] = "collapsed_posture"
+                    result['details']['torso_ratio'] = ratio
+                    return result
+            # Fallback for very small crops if shoulder width is weird
+            elif crop_height > 100 and torso_length < 60:
+                 # Only use pixel check for decent sized crops
+                 result['is_sleeping'] = True
+                 result['reason'] = "collapsed_posture"
+                 result['details']['torso_length'] = torso_length
+                 return result
         
         if has_pt(0) and has_shoulders and (has_pt(7) or has_pt(8)):
             nose_y = kpts[0][1]

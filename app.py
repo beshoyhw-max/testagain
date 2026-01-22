@@ -9,7 +9,7 @@ from PIL import Image
 # Set Page Config
 st.set_page_config(
     page_title="Enterprise Phone Detection",
-    page_icon="🏢",
+    page_icon="📢",
     layout="wide"
 )
 
@@ -40,7 +40,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Title
-st.title("🏢 Enterprise Phone Monitor System")
+st.title("📢 Enterprise Phone Monitor System")
 
 # --- Load Camera Manager (Singleton) ---
 @st.cache_resource
@@ -54,16 +54,60 @@ except Exception as e:
     st.stop()
 
 # --- Sidebar ---
-st.sidebar.header("Global Controls")
-conf_threshold = st.sidebar.slider("Sensitivity (Confidence)", 0.1, 1.0, 0.25)
-# Update manager config whenever this changes
+st.sidebar.header("⚙️ Global Controls")
+
+# Detection Sensitivity
+conf_threshold = st.sidebar.slider(
+    "Detection Sensitivity", 
+    0.1, 1.0, 0.25,
+    help="Lower = more sensitive (more detections, more false positives)"
+)
 manager.update_global_conf(conf_threshold)
+
+st.sidebar.markdown("---")
+
+# Time-Based Thresholds
+st.sidebar.subheader("📱 Phone Detection")
+phone_duration = st.sidebar.slider(
+    "Alert after continuous use (seconds)",
+    min_value=1,
+    max_value=30,
+    value=5,
+    step=1,
+    help="Person must be using phone continuously for this duration before alert"
+)
+manager.update_phone_duration(phone_duration)
+
+st.sidebar.markdown("---")
+
+st.sidebar.subheader("😴 Sleep Detection")
+sleep_duration = st.sidebar.slider(
+    "Alert after sleeping (seconds)",
+    min_value=3,
+    max_value=60,
+    value=10,
+    step=1,
+    help="Person must be sleeping continuously for this duration before alert"
+)
+manager.update_sleep_duration(sleep_duration)
+
+st.sidebar.markdown("---")
+
+st.sidebar.subheader("📸 Evidence Cooldown")
+cooldown_duration = st.sidebar.slider(
+    "Cooldown between screenshots (seconds)",
+    min_value=30,
+    max_value=300,
+    value=120,
+    step=10,
+    help="Minimum time between saving evidence for the same person"
+)
+manager.update_cooldown_duration(cooldown_duration)
 
 st.sidebar.markdown("---")
 st.sidebar.info(f"Active Cameras: {len(manager.get_active_cameras())}")
 
 # --- Navigation ---
-# Using Radio Button instead of Tabs to ensure correct loop breaking
 page_selection = st.radio(
     "Navigate", 
     ["🔴 Live Dashboard", "📸 Evidence Log", "⚙️ Configuration"],
@@ -92,11 +136,16 @@ if page_selection == "🔴 Live Dashboard":
     alert_placeholder = st.empty()
     if alert_texting:
         names_str = ", ".join(alert_texting)
-        alert_placeholder.markdown(f'<div class="alert-box">⚠️ ALERT: PHONE DETECTED IN: {names_str}</div>', unsafe_allow_html=True)
+        alert_placeholder.markdown(
+            f'<div class="alert-box">⚠️ ALERT: PHONE DETECTED IN: {names_str}</div>', 
+            unsafe_allow_html=True
+        )
     elif alert_sleeping:
         names_str = ", ".join(alert_sleeping)
-        # Blue/Purple box for sleep
-        alert_placeholder.markdown(f'<div class="alert-box" style="background-color: #6a0dad;">💤 ALERT: SLEEP DETECTED IN: {names_str}</div>', unsafe_allow_html=True)
+        alert_placeholder.markdown(
+            f'<div class="alert-box" style="background-color: #6a0dad;">💤 ALERT: SLEEP DETECTED IN: {names_str}</div>', 
+            unsafe_allow_html=True
+        )
     else:
         alert_placeholder.empty()
 
@@ -104,16 +153,7 @@ if page_selection == "🔴 Live Dashboard":
     if not active_cams:
         st.warning("No cameras configured. Go to Configuration tab.")
     else:
-        # Determine Grid Size
-        # Simple logic: 1 or 2 cams -> 2 columns. 3+ cams -> 2 columns (multiple rows).
-        # Actually Streamlit columns are horizontal. We iterate and place them.
-        
-        # We want a 2-column grid.
         cols = st.columns(2)
-        
-        # We need to manually handle the refreshing loop for the video
-        # Streamlit doesn't support partial refreshes well without `st.empty` containers.
-        # We will create containers for each camera first.
         
         cam_containers = {}
         cam_ids = list(active_cams.keys())
@@ -123,12 +163,8 @@ if page_selection == "🔴 Live Dashboard":
             with cols[col_idx]:
                 cam = active_cams[cam_id]
                 st.subheader(f"📹 {cam.camera_name}")
-                # Place video FIRST, then status to prevent status text resizing from moving the video
                 frame_view = st.empty()
                 status_text = st.empty()
-                
-                # Add Fullscreen/Stop controls (State management in a loop is tricky in Streamlit, 
-                # usually requires callback buttons. We stick to simple view for now).
                 
                 cam_containers[cam_id] = {
                     "frame": frame_view,
@@ -137,25 +173,18 @@ if page_selection == "🔴 Live Dashboard":
                 }
 
         # Auto-Refresh Loop
-        # We run this loop if the user is on this tab (conceptually).
-        # In Streamlit, the whole script reruns on interaction. 
-        # To get video, we need a while loop inside this tab logic.
-        
-        # Use a unique key to persist state across tab switches
         run_monitor = st.checkbox("Start Live Monitor", value=True, key="run_live_monitor")
         
         if run_monitor:
             placeholder = st.empty()
             with placeholder.container():
-                # We use a placeholder to allow clearing if needed, though not strictly necessary for the loop
                 pass
 
             while True:
-                # Update all cameras
                 loop_texting = []
                 loop_sleeping = []
                 
-                for cam_id, container in cam_containers.items():
+                for cam_id, container in list(cam_containers.items()):
                     thread = container["thread"]
                     frame = thread.get_frame()
                     status = thread.get_status()
@@ -180,25 +209,28 @@ if page_selection == "🔴 Live Dashboard":
                         
                     # Update Frame
                     if frame is not None:
-                        # Resize for bandwidth/performance if needed (optional)
-                        # frame_small = cv2.resize(frame, (640, 360)) 
                         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        container["frame"].image(frame_rgb, width='stretch')
+                        container["frame"].image(frame_rgb, width="stretch")
                     else:
-                        # Show black placeholder
                         container["frame"].info("No Signal")
                 
                 # Update Global Alert inside loop
                 if loop_texting:
                     names_str = ", ".join(loop_texting)
-                    alert_placeholder.markdown(f'<div class="alert-box">⚠️ ALERT: PHONE DETECTED IN: {names_str}</div>', unsafe_allow_html=True)
+                    alert_placeholder.markdown(
+                        f'<div class="alert-box">⚠️ ALERT: PHONE DETECTED IN: {names_str}</div>', 
+                        unsafe_allow_html=True
+                    )
                 elif loop_sleeping:
                     names_str = ", ".join(loop_sleeping)
-                    alert_placeholder.markdown(f'<div class="alert-box" style="background-color: #6a0dad;">💤 ALERT: SLEEP DETECTED IN: {names_str}</div>', unsafe_allow_html=True)
+                    alert_placeholder.markdown(
+                        f'<div class="alert-box" style="background-color: #6a0dad;">💤 ALERT: SLEEP DETECTED IN: {names_str}</div>', 
+                        unsafe_allow_html=True
+                    )
                 else:
                     alert_placeholder.empty()
                 
-                # Sleep to limit UI refresh rate (separate from detection rate)
+                # Sleep to limit UI refresh rate
                 time.sleep(0.1)
 
 # --- Page 2: Evidence Log ---
@@ -219,10 +251,6 @@ elif page_selection == "📸 Evidence Log":
             with cols[idx % 4]:
                 image = Image.open(img_path)
                 st.image(image, width="stretch")
-                # Parse filename
-                # format: evidence_{cam_name}_{timestamp}.jpg
-                # filename = os.path.basename(img_path)
-                # Display clean name
                 st.caption(os.path.basename(img_path))
 
 # --- Page 3: Configuration ---
@@ -232,16 +260,18 @@ elif page_selection == "⚙️ Configuration":
     # List Existing
     st.subheader("Active Cameras")
     
-    # Since we can't easily iterate and delete inside a form, we use a container
     active_cams = manager.get_active_cameras()
     
-    for cam_id, cam in list(active_cams.items()):
-        col1, col2, col3 = st.columns([1, 3, 1])
-        col1.write(f"**ID: {cam_id}**")
-        col2.write(f"{cam.camera_name} ({cam.source})")
-        if col3.button("Remove", key=f"del_{cam_id}"):
-            manager.remove_camera(cam_id)
-            st.rerun()
+    if not active_cams:
+        st.info("No cameras configured yet.")
+    else:
+        for cam_id, cam in list(active_cams.items()):
+            col1, col2, col3 = st.columns([1, 3, 1])
+            col1.write(f"**ID: {cam_id}**")
+            col2.write(f"{cam.camera_name} ({cam.source})")
+            if col3.button("Remove", key=f"del_{cam_id}"):
+                manager.remove_camera(cam_id)
+                st.rerun()
             
     st.markdown("---")
     st.subheader("Add New Camera")
@@ -255,10 +285,10 @@ elif page_selection == "⚙️ Configuration":
             if new_name:
                 manager.add_camera(new_name, new_source)
                 st.success(f"Added {new_name}")
-                time.sleep(1) # Allow user to see success
+                time.sleep(1)
                 st.rerun()
             else:
                 st.error("Name is required.")
 
     st.markdown("---")
-    st.info("Use '0', '1' for local webcams. Use 'rtsp://...' for IP cameras.")
+    st.info("💡 Use '0', '1' for local webcams. Use 'rtsp://...' for IP cameras.")

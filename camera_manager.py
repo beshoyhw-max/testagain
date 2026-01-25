@@ -10,14 +10,11 @@ from ultralytics import YOLO
 # Force TCP connection (critical for Huawei cameras and general RTSP stability)
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
-# Shared Lock for Model Inference to prevent race conditions/OOM if using GPU
-model_lock = threading.Lock()
 
 class VideoReader:
     """
     Dedicated thread for reading frames from a video source.
     Ensures that we always have the latest frame available, discarding older ones.
-    Solves the producer-consumer lag issue.
     """
     def __init__(self, source, camera_name="Unknown"):
         self.source = source
@@ -29,7 +26,6 @@ class VideoReader:
         self.running = False
         self.connected = False
         
-        # Start reading thread
         self.thread = threading.Thread(target=self.update, args=(), daemon=True)
         
     def start(self):
@@ -50,95 +46,136 @@ class VideoReader:
             if self.cap is None or not self.cap.isOpened():
                 self.connected = False
                 print(f"[{self.camera_name}] Connecting to source...")
+                
+                if self.cap is not None:
+                    try:
+                        self.cap.release()
+                    except:
+                        pass
+                    self.cap = None
+
                 self.cap = cv2.VideoCapture(self.source)
                 
-                # Optimize for webcam
                 is_webcam = isinstance(self.source, int) or (isinstance(self.source, str) and self.source.isdigit())
                 
                 if is_webcam:
                     self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
                     self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 
-                # Critical for low latency
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
                 
-                # Check for file source to throttle FPS
-                self.fps = 30 # Default
+                self.fps = 30
                 self.is_file = False
                 if not is_webcam and isinstance(self.source, str) and not self.source.startswith("rtsp"):
-                     # Assume file if not int and not rtsp
-                     # (Could be improved with os.path.exists check but remote URLs exist)
                      if os.path.exists(self.source):
                          self.is_file = True
                          self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-                         if self.fps <= 0: self.fps = 30
+                         if self.fps <= 0: 
+                             self.fps = 30
                          print(f"[{self.camera_name}] File detected. FPS: {self.fps}")
 
                 if not self.cap.isOpened():
                     print(f"[{self.camera_name}] Connection failed. Retrying in 5s...")
+                    try:
+                        self.cap.release()
+                    except:
+                        pass
+                    self.cap = None
                     time.sleep(5)
                     continue
                 
-                print(f"[{self.camera_name}] Connected.")
+                print(f"[{self.camera_name}] Connected successfully.")
                 self.connected = True
 
-            # Read frame
             try:
                 ret, frame = self.cap.read()
                 if ret:
                     self.frame = frame
                     self.last_read_time = time.time()
                     
-                    # Throttle if file
                     if self.is_file:
                         time.sleep(1.0 / self.fps)
                         
                 else:
-                    # Stream lost or end of file
                     print(f"[{self.camera_name}] Stream read failed.")
-                    self.cap.release()
+                    if self.cap:
+                        try:
+                            self.cap.release()
+                        except:
+                            pass
+                        self.cap = None
                     self.connected = False
-                    time.sleep(0.5) # Wait before retry
+                    time.sleep(0.5)
+                    
             except Exception as e:
                 print(f"[{self.camera_name}] Error reading frame: {e}")
                 self.connected = False
                 if self.cap:
-                    self.cap.release()
+                    try:
+                        self.cap.release()
+                    except:
+                        pass
+                    self.cap = None
                 time.sleep(1)
 
     def get_frame(self):
         return self.frame, self.last_read_time
         
     def is_connected(self):
-        # Consider connected if we read a frame recently
         return self.connected and (time.time() - self.last_read_time < 3.0)
 
 
 class CameraThread(threading.Thread):
-    def __init__(self, camera_config, shared_model, shared_pose_model, conf_threshold=0.25):
+    def __init__(self, camera_config, conf_threshold=0.25, 
+                 phone_duration=5.0, sleep_duration=10.0, cooldown_duration=120.0,
+                 skip_frames=5, enable_face_recognition=False):
+        """
+        Camera thread with TIME-BASED detection thresholds and face recognition.
+        
+        Args:
+            phone_duration: Seconds of continuous phone use before alert
+            sleep_duration: Seconds of continuous sleep before alert
+            cooldown_duration: Seconds between evidence screenshots
+            skip_frames: Process every Nth frame (higher = faster, less accurate)
+            enable_face_recognition: Enable face recognition for person identification
+        """
         super().__init__()
         self.camera_id = camera_config['id']
         self.camera_name = camera_config['name']
         self.source = camera_config['source']
-        self.shared_model = shared_model
-        self.shared_pose_model = shared_pose_model
         
-        # Initialize independent detector state for this camera
-        # Pass model_instance=None to force loading a fresh private model for tracking
+        print(f"[{self.camera_name}] Initializing private detector with time-based thresholds...")
+        print(f"  → Phone alert after: {phone_duration}s continuous use")
+        print(f"  → Sleep alert after: {sleep_duration}s continuous sleep")
+        print(f"  → Cooldown period: {cooldown_duration}s")
+        print(f"  → Face recognition: {'ENABLED' if enable_face_recognition else 'DISABLED'}")
+        
         self.detector = PhoneDetector(
+            model_path='yolo26n.pt',
+            pose_model_path='yolo26n-pose.pt',
             model_instance=None,
-            pose_model_instance=self.shared_pose_model,
-            lock=None # No lock needed for private model
+            pose_model_instance=None,
+            lock=None,
+            phone_duration_threshold=phone_duration,
+            sleep_duration_threshold=sleep_duration,
+            cooldown_seconds=cooldown_duration,
+            enable_face_recognition=enable_face_recognition
         )
+        print(f"[{self.camera_name}] Detector ready.")
         
         self.conf_threshold = conf_threshold
+        self.phone_duration = phone_duration
+        self.sleep_duration = sleep_duration
+        self.cooldown_duration = cooldown_duration
+        self.skip_frames = skip_frames
+        self.enable_face_recognition = enable_face_recognition
+        
         self.running = False
         self.latest_processed_frame = None
         self.status = "safe"
         self.last_update_time = 0
         self.last_processed_timestamp = 0
         
-        # Initialize VideoReader
         self.reader = VideoReader(self.source, self.camera_name)
         
     def run(self):
@@ -149,33 +186,24 @@ class CameraThread(threading.Thread):
         frame_count = 0
         
         while self.running:
-            # Check connection status
             if not self.reader.is_connected():
                 self.status = "disconnected"
                 time.sleep(0.5)
                 continue
             
-            # Get latest frame from reader
             raw_frame, timestamp = self.reader.get_frame()
             
-            # Skip if no frame or if we already processed this frame
             if raw_frame is None or timestamp == self.last_processed_timestamp:
-                # Frame not ready or duplicate
                 time.sleep(0.01)
                 continue
             
             self.last_processed_timestamp = timestamp
 
-            # Process Frame
-            # process_frame returns (frame, status_string, is_saved)
-            # We process EVERY frame we get from the reader (which is already skipping frames naturally)
-            # But we still pass frame_count to detector for its internal consistency checks (skip_frames arg)
-            
             try:
                 processed_frame, status, is_saved = self.detector.process_frame(
                     raw_frame, 
                     frame_count, 
-                    skip_frames=3, # Still skip internally if needed for performance
+                    skip_frames=self.skip_frames,
                     save_screenshots=True,
                     conf_threshold=self.conf_threshold,
                     camera_name=self.camera_name
@@ -187,10 +215,10 @@ class CameraThread(threading.Thread):
                 
             except Exception as e:
                 print(f"[{self.camera_name}] Error in processing: {e}")
+                import traceback
+                traceback.print_exc()
             
             frame_count += 1
-            
-            # Small sleep to prevent CPU hogging in this loop
             time.sleep(0.01)
 
         print(f"[{self.camera_name}] Processing thread stopped.")
@@ -198,50 +226,72 @@ class CameraThread(threading.Thread):
 
     def stop(self):
         self.running = False
-        self.join()
+        self.join(timeout=2.0)
 
     def get_frame(self):
         return self.latest_processed_frame
 
     def get_status(self):
-        # If data is stale (> 3 seconds), consider it disconnected
         if time.time() - self.last_update_time > 3.0:
             return "disconnected"
         return self.status
+    
+    def update_thresholds(self, conf=None, phone_dur=None, sleep_dur=None, cooldown=None, skip_frames=None):
+        """Update detection thresholds on the fly."""
+        if conf is not None:
+            self.conf_threshold = conf
+        if phone_dur is not None:
+            self.phone_duration = phone_dur
+            self.detector.phone_duration_threshold = phone_dur
+        if sleep_dur is not None:
+            self.sleep_duration = sleep_dur
+            self.detector.sleep_duration_threshold = sleep_dur
+        if cooldown is not None:
+            self.cooldown_duration = cooldown
+            self.detector.cooldown_seconds = cooldown
+        if skip_frames is not None:
+            self.skip_frames = skip_frames
+
 
 class CameraManager:
     def __init__(self, config_file="cameras.json"):
+        """
+        Camera Manager with TIME-BASED detection configuration and face recognition.
+        """
         self.config_file = config_file
-        self.cameras = {} # id -> CameraThread
-        self.shared_model = None
-        self.shared_pose_model = None
+        self.cameras = {}
         
-        # Load Model Once
-        # Note: Detection model is now loaded per-camera to support tracking persistence
-        print("Loading Shared YOLO Model (Pose)...")
-        self.shared_pose_model = YOLO('yolo26n-pose.pt')
-        print("Models Loaded.")
+        # Global thresholds
+        self.global_conf = 0.25
+        self.global_phone_duration = 5.0
+        self.global_sleep_duration = 10.0
+        self.global_cooldown = 120.0
+        self.global_skip_frames = 5
+        self.global_face_recognition = False  # Default disabled
+        
+        print("=" * 70)
+        print("Initializing Camera Manager - TIME-BASED DETECTION")
+        print("Architecture: Private models per thread")
+        print("=" * 70)
         
         self.load_config_and_start()
 
     def load_config_and_start(self):
         if not os.path.exists(self.config_file):
-            # Default config: Webcam
             default_config = [
                 {"id": 0, "name": "Webcam Main", "source": 0}
             ]
             with open(self.config_file, 'w') as f:
-                json.dump(default_config, f)
+                json.dump(default_config, f, indent=2)
         
         with open(self.config_file, 'r') as f:
             configs = json.load(f)
             
-        # Start threads for each config
         for conf in configs:
             self.add_camera_thread(conf)
 
     def add_camera_thread(self, config):
-        # Convert source to int if it's a digit (for webcam index)
+        """Add a camera thread with current global thresholds."""
         source = config['source']
         if isinstance(source, str) and source.isdigit():
             source = int(source)
@@ -249,23 +299,34 @@ class CameraManager:
 
         cam_id = config['id']
         if cam_id in self.cameras:
-            return # Already running
-            
-        thread = CameraThread(config, None, self.shared_pose_model)
+            print(f"Camera {cam_id} already running.")
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"Starting Camera {cam_id}: {config['name']}")
+        print(f"{'='*60}")
+        
+        thread = CameraThread(
+            config,
+            conf_threshold=self.global_conf,
+            phone_duration=self.global_phone_duration,
+            sleep_duration=self.global_sleep_duration,
+            cooldown_duration=self.global_cooldown,
+            skip_frames=self.global_skip_frames,
+            enable_face_recognition=self.global_face_recognition
+        )
         thread.start()
         self.cameras[cam_id] = thread
+        
+        print(f"[Camera {cam_id}] Started successfully.\n")
 
     def add_camera(self, name, source):
-        # Generate new ID
         existing_ids = [c.camera_id for c in self.cameras.values()]
         new_id = max(existing_ids) + 1 if existing_ids else 0
         
         new_config = {"id": new_id, "name": name, "source": source}
         
-        # Update JSON
         self.save_config_append(new_config)
-        
-        # Start Thread
         self.add_camera_thread(new_config)
 
     def remove_camera(self, cam_id):
@@ -273,27 +334,67 @@ class CameraManager:
             print(f"Removing camera {cam_id}...")
             self.cameras[cam_id].stop()
             del self.cameras[cam_id]
-            
-            # Update JSON
             self.save_config_remove(cam_id)
+            print(f"Camera {cam_id} removed.")
 
     def save_config_append(self, new_config):
-        with open(self.config_file, 'r') as f:
-            configs = json.load(f)
-        configs.append(new_config)
-        with open(self.config_file, 'w') as f:
-            json.dump(configs, f)
+        try:
+            with open(self.config_file, 'r') as f:
+                configs = json.load(f)
+            configs.append(new_config)
+            with open(self.config_file, 'w') as f:
+                json.dump(configs, f, indent=2)
+        except Exception as e:
+            print(f"Error saving config: {e}")
 
     def save_config_remove(self, cam_id):
-        with open(self.config_file, 'r') as f:
-            configs = json.load(f)
-        configs = [c for c in configs if c['id'] != cam_id]
-        with open(self.config_file, 'w') as f:
-            json.dump(configs, f)
+        try:
+            with open(self.config_file, 'r') as f:
+                configs = json.load(f)
+            configs = [c for c in configs if c['id'] != cam_id]
+            with open(self.config_file, 'w') as f:
+                json.dump(configs, f, indent=2)
+        except Exception as e:
+            print(f"Error saving config: {e}")
 
     def get_active_cameras(self):
         return self.cameras
 
     def update_global_conf(self, conf):
+        """Update confidence threshold for all cameras."""
+        self.global_conf = conf
         for cam in self.cameras.values():
-            cam.conf_threshold = conf
+            cam.update_thresholds(conf=conf)
+    
+    def update_phone_duration(self, duration):
+        """Update phone detection duration for all cameras."""
+        self.global_phone_duration = duration
+        for cam in self.cameras.values():
+            cam.update_thresholds(phone_dur=duration)
+    
+    def update_sleep_duration(self, duration):
+        """Update sleep detection duration for all cameras."""
+        self.global_sleep_duration = duration
+        for cam in self.cameras.values():
+            cam.update_thresholds(sleep_dur=duration)
+    
+    def update_cooldown_duration(self, duration):
+        """Update cooldown duration for all cameras."""
+        self.global_cooldown = duration
+        for cam in self.cameras.values():
+            cam.update_thresholds(cooldown=duration)
+    
+    def update_skip_frames(self, skip_frames):
+        """Update skip frames for all cameras."""
+        self.global_skip_frames = skip_frames
+        for cam in self.cameras.values():
+            cam.update_thresholds(skip_frames=skip_frames)
+    
+    def enable_face_recognition(self, enabled):
+        """
+        Enable/disable face recognition globally.
+        Note: Requires camera restart to take effect.
+        """
+        self.global_face_recognition = enabled
+        print(f"Face recognition {'ENABLED' if enabled else 'DISABLED'} for new cameras")
+        print("Note: Restart existing cameras for changes to take effect")

@@ -1,0 +1,21 @@
+# Core Dependencies
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+numpy>=1.24.0,<2.0.0
+Pillow>=10.0.0
+
+# YOLO Detection
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# MediaPipe for Face Landmarks & Sleep Detection
+mediapipe>=0.10.0
+
+# Streamlit for Web UI
+streamlit>=1.28.0
+
+# Optional but recommended for better performance
+# Uncomment if you have CUDA-capable GPU
+# torch==2.1.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+# torchvision==0.16.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118

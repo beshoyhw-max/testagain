@@ -1,73 +1,168 @@
+#!/usr/bin/env python3
+"""
+Export YOLO models to TensorRT
+No separate tensorrt package needed!
+"""
+
 from ultralytics import YOLO
 import torch
-import argparse
 import os
+import sys
 
-def main():
-    parser = argparse.ArgumentParser(description='TensorRT Export for 4GB GPU')
-    parser.add_argument('model', type=str, help='Path to .pt model')
-    parser.add_argument('--imgsz', type=int, default=1280, help='Image size (default: 1280)')
-    parser.add_argument('--workspace', type=int, default=2, help='Workspace GB (default: 2 for 4GB GPU)')
-    parser.add_argument('--half', action='store_true', help='Use FP16 to save memory')
+def check_requirements():
+    """Check if system is ready for TensorRT export."""
+    print("="*70)
+    print("System Check")
+    print("="*70)
     
-    args = parser.parse_args()
+    # Check PyTorch
+    print(f"✓ PyTorch: {torch.__version__}")
     
-    # Check GPU
+    # Check CUDA
     if not torch.cuda.is_available():
-        print("❌ CUDA not available")
-        return
+        print("✗ CUDA not available")
+        print("\nInstall CUDA-enabled PyTorch:")
+        print("pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118")
+        return False
     
-    gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    print(f"✓ CUDA available")
+    print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
+    
+    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+    print(f"✓ GPU Memory: {gpu_memory:.1f} GB")
+    
+    if gpu_memory < 5:
+        print(f"  ⚠️  Limited memory - using workspace=2GB")
+    
+    # Check Ultralytics
+    try:
+        from ultralytics import __version__
+        print(f"✓ Ultralytics: {__version__}")
+    except:
+        print("✗ Ultralytics not found")
+        print("pip install ultralytics")
+        return False
     
     print("="*70)
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Memory: {gpu_memory_gb:.2f} GB")
-    print("="*70)
+    print("✅ System ready for TensorRT export!\n")
+    return True
+
+def export_model(model_path, imgsz=1280, workspace=2):
+    """Export a single model to TensorRT."""
     
-    # Auto-adjust workspace for small GPUs
-    if gpu_memory_gb < 5 and args.workspace > 2:
-        print(f"⚠️  Auto-adjusting workspace from {args.workspace}GB to 2GB for 4GB GPU")
-        args.workspace = 2
+    if not os.path.exists(model_path):
+        print(f"⚠️  Model not found: {model_path}")
+        return None
     
-    print(f"\nExport settings:")
-    print(f"  Model: {args.model}")
-    print(f"  Image size: {args.imgsz}")
-    print(f"  Workspace: {args.workspace}GB")
-    print(f"  Precision: {'FP16' if args.half else 'FP32'}")
-    print()
-    
-    # Clear cache
-    torch.cuda.empty_cache()
-    
-    # Load and export
-    model = YOLO(args.model)
+    print(f"\n{'='*70}")
+    print(f"Exporting: {model_path}")
+    print(f"{'='*70}")
     
     try:
+        # Load model
+        print(f"Loading model...")
+        model = YOLO(model_path)
+        
+        # Clear GPU cache
+        torch.cuda.empty_cache()
+        
+        # Export to TensorRT
+        print(f"Exporting to TensorRT...")
+        print(f"  → Image size: {imgsz}x{imgsz}")
+        print(f"  → Precision: FP32")
+        print(f"  → Workspace: {workspace}GB")
+        
         engine_path = model.export(
-            format='engine',
-            imgsz=args.imgsz,
-            batch=1,
-            half=args.half,
-            workspace=args.workspace,
-            simplify=True,
-            dynamic=False,
-            verbose=True
+            format='engine',      # TensorRT format
+            imgsz=imgsz,         # Image size
+            batch=1,             # Batch size
+            half=False,          # FP32 (not FP16)
+            workspace=workspace, # Workspace in GB
+            simplify=True,       # Simplify ONNX
+            dynamic=False,       # Static shapes
+            verbose=True         # Show progress
         )
         
-        print(f"\n✅ Export successful: {engine_path}")
+        # Success
+        print(f"\n✅ Export successful!")
+        print(f"   Output: {engine_path}")
         
         if os.path.exists(engine_path):
             size_mb = os.path.getsize(engine_path) / 1e6
             print(f"   Size: {size_mb:.1f} MB")
         
+        return engine_path
+        
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             print(f"\n❌ GPU Out of Memory!")
-            print(f"\nTry these options:")
-            print(f"  • python {__file__} {args.model} --workspace 1")
-            print(f"  • python {__file__} {args.model} --imgsz 640 --workspace 2")
-            print(f"  • python {__file__} {args.model} --half --workspace 2")
-        raise
+            print(f"\nTry:")
+            print(f"  • Reduce workspace: --workspace 1")
+            print(f"  • Reduce image size: --imgsz 640")
+            print(f"  • Close other GPU programs")
+        else:
+            print(f"\n❌ Export failed: {e}")
+        return None
+        
+    except Exception as e:
+        print(f"\n❌ Export failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def main():
+    """Export all YOLO models."""
+    
+    # Check system requirements
+    if not check_requirements():
+        sys.exit(1)
+    
+    # Determine workspace based on GPU memory
+    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+    workspace = 2 if gpu_memory < 5 else 4
+    
+    # Models to export
+    models = [
+        'yolo26n.pt',
+        'yolo26n-pose.pt',
+        'yolo11n.pt',
+    ]
+    
+    print(f"Found {sum(os.path.exists(m) for m in models)} model(s) to export")
+    print(f"Using workspace: {workspace}GB\n")
+    
+    # Export each model
+    exported = []
+    failed = []
+    
+    for model_path in models:
+        engine_path = export_model(model_path, imgsz=1280, workspace=workspace)
+        
+        if engine_path:
+            exported.append((model_path, engine_path))
+        else:
+            failed.append(model_path)
+    
+    # Summary
+    print("\n" + "="*70)
+    print("EXPORT SUMMARY")
+    print("="*70)
+    print(f"✅ Successful: {len(exported)}")
+    print(f"❌ Failed: {len(failed)}")
+    
+    if exported:
+        print("\n✅ Exported models:")
+        for pt, engine in exported:
+            print(f"  {pt} → {engine}")
+    
+    if failed:
+        print("\n❌ Failed models:")
+        for model in failed:
+            print(f"  {model}")
+    
+    print("\n" + "="*70)
+    print("Next: Update your code to use .engine files")
+    print("="*70)
 
 if __name__ == "__main__":
     main()

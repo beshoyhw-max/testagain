@@ -11,13 +11,27 @@ def check_gpu():
     """Verify CUDA is available"""
     if not torch.cuda.is_available():
         print("❌ CUDA not available! TensorRT requires GPU.")
-        print("   Check: nvidia-smi")
+        print("\n   TROUBLESHOOTING:")
+        print("   1. Run: python verify_cuda_setup.py")
+        print("   2. Check: nvidia-smi")
+        print("   3. Verify PyTorch CUDA installation:")
+        print("      python -c \"import torch; print(torch.cuda.is_available())\"")
+        print("\n   If CUDA still not working:")
+        print("   - Reinstall PyTorch with CUDA:")
+        print("     pip uninstall torch torchvision")
+        print("     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121")
         return False
     
     print("✅ CUDA Available")
     print(f"   GPU: {torch.cuda.get_device_name(0)}")
     print(f"   CUDA Version: {torch.version.cuda}")
     print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    
+    # Additional checks
+    if torch.cuda.get_device_properties(0).total_memory < 3 * 1024**3:
+        print("   ⚠️  Warning: Less than 3GB VRAM detected")
+        print("      Consider using smaller models or lower resolution")
+    
     return True
 
 def convert_model(model_path, imgsz=1280, half=True, workspace=4):
